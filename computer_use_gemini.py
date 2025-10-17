@@ -76,15 +76,28 @@ class ComputerUseAgent:
         """정규화된 y 좌표를 실제 픽셀 좌표로 변환"""
         return int(y / 1000 * self.screen_height)
 
+    def execute_javascript(self, code: str):
+        """자바스크립트 함수 실행하는 custom tool 함수"""  
+        return self.page.evaluate(code)
+
     def create_computer_use_config(self) -> genai.types.GenerateContentConfig:
         """Computer Use 설정 생성"""
+        custom_functions = [
+            types.FunctionDeclaration.from_callable(  
+                client=self.client, callable=self.execute_javascript  
+            )  
+        ]
+
         return genai.types.GenerateContentConfig(
             tools=[
                 types.Tool(
                     computer_use=types.ComputerUse(
-                        environment=types.Environment.ENVIRONMENT_BROWSER
+                        environment=types.Environment.ENVIRONMENT_BROWSER,
                     )
-                )
+                ),
+                types.Tool(
+                    function_declarations=custom_functions,
+                ),
             ]
         )
 
@@ -105,13 +118,14 @@ class ComputerUseAgent:
             args = function_call.args
             extra_fields = {}
 
-            print(f"  -> 실행 중: {fname}")
+            print(f"  🔧 실행 중: {fname}")
+            print(f"  📋 인자: {args}")
 
             # Safety decision 확인
             if 'safety_decision' in args:
                 decision = self.get_safety_confirmation(args['safety_decision'])
                 if decision == "TERMINATE":
-                    print("에이전트 루프를 종료합니다.")
+                    print("🛑 에이전트 루프를 종료합니다.")
                     break
                 extra_fields["safety_acknowledgement"] = "true"
                 safety_acknowledgements[fname] = True
@@ -142,7 +156,11 @@ class ComputerUseAgent:
                         self.page.keyboard.press("Backspace")
 
                     # 텍스트 입력
-                    self.page.keyboard.type(text)
+                    # self.page.keyboard.type(text)
+                    for char in text:  
+                        self.page.keyboard.press(char)  
+                        time.sleep(0.05)  # 짧은 딜레이 추가
+
                     if press_enter:
                         self.page.keyboard.press("Enter")
 
@@ -173,6 +191,10 @@ class ComputerUseAgent:
                     time.sleep(5)
                     action_result = {"success": True, "message": "5초 대기했습니다."}
 
+                elif fname == "execute_javascript":  
+                    self.execute_javascript(code=args["code"])
+                    action_result = {"success": True, "message": f"자바스크립트를 실행했습니다: {args['code']}"}
+
                 else:
                     action_result = {"success": False, "message": f"지원되지 않는 액션: {fname}"}
 
@@ -180,11 +202,13 @@ class ComputerUseAgent:
                 action_result.update(extra_fields)
 
                 # 대기 및 로딩
+                print(f"  ⏳ 페이지 로딩 대기 중...")
                 self.page.wait_for_load_state(timeout=5000)
                 time.sleep(1)
+                print(f"  ✅ 액션 완료: {action_result.get('message', '성공')}")
 
             except Exception as e:
-                print(f"오류 발생 {fname}: {e}")
+                print(f"  ❌ 오류 발생 {fname}: {e}")
                 action_result = {"error": str(e)}
 
             results.append((fname, action_result))
@@ -319,17 +343,22 @@ class ComputerUseAgent:
                 candidate = response.candidates[0]
                 contents.append(candidate.content)
 
+                # Gemini의 응답 텍스트 출력
+                response_text = " ".join([part.text for part in candidate.content.parts if hasattr(part, 'text') and part.text])
+                if response_text:
+                    print(f"🤖 Gemini 응답: {response_text[:200]}{'...' if len(response_text) > 200 else ''}")
+
                 # Function Call이 있는지 확인
                 if not self.has_function_calls(candidate):
                     # 최종 응답
-                    text_response = " ".join([part.text for part in candidate.content.parts if hasattr(part, 'text') and part.text])
-                    print(f"🤖 최종 응답: {text_response}")
+                    text_response = response_text
+                    print(f"🎯 작업 완료! 최종 응답: {text_response}")
                     break
 
-                print("액션 실행 중...")
+                print("⚡ 액션 실행 중...")
                 results, safety_acknowledgements = self.execute_function_calls(candidate)
 
-                print("상태 캡처 중...")
+                print("📊 실행 결과 처리 중...")
                 function_responses = self.get_function_responses(results, safety_acknowledgements)
 
                 # Function Response를 대화 기록에 추가
@@ -345,14 +374,19 @@ class ComputerUseAgent:
 
             # JSON 추출 시도
             if text_response:
+                print(f"\n🔍 JSON 데이터 추출 시도 중...")
+                print(f"📝 원본 응답: {text_response}")
                 extracted_json = self.extract_json_from_response(text_response)
                 if extracted_json:
-                    print(f"✅ JSON 추출 성공: {extracted_json}")
+                    print(f"✅ JSON 추출 성공!")
+                    print(f"📊 추출된 데이터: {extracted_json}")
                     return extracted_json
                 else:
-                    print("⚠️ JSON 추출 실패")
+                    print("⚠️ JSON 추출 실패 - 구조화된 데이터를 찾을 수 없습니다")
                     return None
-            return None
+            else:
+                print("⚠️ 최종 텍스트 응답이 없습니다")
+                return None
 
         except Exception as e:
             print(f"❌ 작업 실행 중 오류 발생: {str(e)}")
@@ -366,9 +400,25 @@ def main():
 
     # 예제 작업 실행
     agent.run_task(
-        task="https://www.dubaifuture.ae/ 페이지 접속해서 회사 파트너십 문의 이메일로 판단할 수 있는 이메일(contact_email) 1개와 대표 전화번호(contact_call) 1개를 찾아서 json 형식으로 주세요",
-        url="https://www.dubaifuture.ae/",
-        max_turns=20
+        #task=f"""document.getElementById('chkUseMyKD1').click(); 자바스크립트 함수 실행해주세요""",
+        #url="https://highbuff.com/company",
+
+
+        task=f"""
+        1) 로그인 페이지가 켜지면 [키보드보안사용] 체크박스를 클릭해서 키보드보안을 해제해주세요.
+        2) 로그인란에 아이디 **highbuff** 비밀번호 **Com12!@** 공동인증서 비밀번호 **Comcom12!@**를 입력하고 로그인 버튼을 클릭합니다
+        3) 로그인이 완료되면 이체 페이지 중단 [계좌비밀번호] 텍스트 입력란에 **8091** 이라는 비밀번호를 입력합니다.
+        4) [이체금액] 텍스트 입력란에는 **1000**원을 입력합니다.
+        5) 브라우저 창에서 **javascript:selectBank('004', '국민');** 자바스크립트 함수를 실행시킵니다.
+        6) [금융기관] 텍스트 입력란에는 **국민** 이 입력되었는지 확인합니다.
+        7) [입금계좌번호] 영역에 계좌번호란에는 **94071273750** 을 입력하고 [조회] 버튼을 클릭합니다.
+        8) [조회] 버튼을 클릭하면 예금주 이름이 노출되는데 **임건기**와 일치한지 비교합니다. 일치하지않으면 에러메시지를 노출하고 작업을 중단합니다.
+        9) 이상이 없다면 [받는분통장표시내용] 텍스트 입력란에는 **하이버프** 입력힙니다.
+        10) 우측 하단에 [이체실행] 버튼을 클릭하면 다음 페이지로 이동합니다.
+        11) 입력된 정보가 맞는지 확인하고 [실물OTP번호입력] 텍스트입력란에 **123456** 입력합니다.
+        12) 우측 하단에 [다음] 버튼을 클릭합니다. """,
+        url="https://www.daishin.com/g.ds?p=90&v=73&m=139&returnUrl=%2Fg.ds%3Fm%3D162%26p%3D383%26v%3D228",
+        max_turns=30
     )
 
 if __name__ == "__main__":
